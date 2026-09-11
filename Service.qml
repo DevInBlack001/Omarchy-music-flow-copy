@@ -224,8 +224,26 @@ Item {
     }
   }
 
-  readonly property var sourcePlayers: orderedSourcePlayers()
-  readonly property var sourceCyclePlayers: orderedCycleSourcePlayers()
+  // Plain properties, refreshed via refreshSourcePlayers() below, instead of the
+  // eager `readonly property var sourcePlayers: orderedSourcePlayers()` this used
+  // to be. That binding read `players` (Mpris.players.values) directly, so it
+  // recomputed - and reassigned a brand-new array to BarWidget.qml's
+  // `Repeater { model: root.sourcePlayers }` - synchronously, in the exact same
+  // tick Quickshell's own Mpris code removes and destroys a closed browser's
+  // player object. That's the actual trigger proven by every crash reproduction:
+  // browser closes -> "Unregistered MprisPlayer" -> Repeater::setModel ->
+  // regenerate -> incubate segfaults inside Qt's delegate-model machinery, which
+  // isn't reentrancy-safe against a model swap landing mid-teardown of an object
+  // one of its delegates still references. Deferring the recompute with
+  // Qt.callLater (see refreshSourcePlayers) moves the Repeater's model
+  // reassignment to a later event-loop tick, off that same call stack.
+  property var sourcePlayers: []
+  property var sourceCyclePlayers: []
+
+  function refreshSourcePlayers() {
+    sourcePlayers = orderedSourcePlayers()
+    sourceCyclePlayers = orderedCycleSourcePlayers()
+  }
   // playerStartedAt changes every time syncPlayingOrder() runs (it writes playerStartedAt = next).
   // syncPlayingOrder() is called on every onIsPlayingChanged (via Instantiator below) and on
   // onPlayersChanged. So activePlayer re-evaluates automatically on every pause/resume/switch.
@@ -237,6 +255,14 @@ Item {
     var _lk = lastActivePlayerKey
     return selectActivePlayer()
   }
+
+  // Qt.callLater coalesces same-tick calls and, more importantly, runs this
+  // outside the current synchronous property-notify cascade - by the time it
+  // fires, activePlayer's binding (and whatever triggered it, e.g. a
+  // syncPlayingOrder() from a player disappearing) is fully off the call
+  // stack, so writing lastActivePlayerKey/preferredPlayerKey here can only
+  // start a fresh, later notify cascade, never nest inside this one.
+  onActivePlayerChanged: Qt.callLater(rememberActivePlayer)
 
   // isPlaying reads activePlayer.isPlaying directly — a real QML property access.
   // When activePlayer switches (e.g. Spotify→YouTube), this re-evaluates immediately.
@@ -255,11 +281,11 @@ Item {
       required property var modelData
       target: modelData
       function onIsPlayingChanged() {
-        root.syncPlayingOrder()
+        Qt.callLater(root.syncPlayingOrder)
         root.playbackVersion++
       }
       function onPlaybackStateChanged() {
-        root.syncPlayingOrder()
+        Qt.callLater(root.syncPlayingOrder)
         root.playbackVersion++
       }
       function onMetadataChanged() {
@@ -542,22 +568,33 @@ Item {
     return newest || null
   }
 
+  // Pure: only reads preferredPlayerKey/lastActivePlayerKey/players, never writes
+  // them. This is called from the activePlayer binding below - a binding that
+  // writes to its own dependencies while it's still being evaluated is a binding
+  // loop, and this one was (Quickshell's own scene log confirmed it: "Binding
+  // loop detected for property 'activePlayer'"). Reproduced as a real crash, not
+  // just a benign warning: closing a browser removes its MPRIS player, which
+  // fires onPlayersChanged -> syncPlayingOrder() -> writes playerStartedAt, which
+  // re-triggers this binding, which used to write lastActivePlayerKey/
+  // preferredPlayerKey mid-evaluation, retriggering itself again - a cascade that
+  // showed up in coredumps as 4 nested QQmlBinding update frames terminating in
+  // QQuickRepeater::setModel -> regenerate -> incubate (the sourcePlayers-bound
+  // Repeater in BarWidget.qml), segfaulting inside Qt's delegate-model machinery
+  // while it was reentered mid-update. The "remember what we picked" side effects
+  // now live in rememberActivePlayer() below, deferred via Qt.callLater so they
+  // can never run while this binding is still on the call stack.
   function selectActivePlayer() {
     // 1. User explicitly selected a preferred player
     if (preferredPlayerKey) {
       var preferred = playerForKey(preferredPlayerKey)
       if (preferred && hasMetadata(preferred)) {
         if (isPlayerActive(preferred)) {
-          lastActivePlayerKey = preferredPlayerKey
           return preferred
         }
         // Preferred player is paused — check if any OTHER player is actively playing
         var otherPlaying = mostRecentPlayingPlayer()
         if (otherPlaying) {
           // A different player is actively playing — switch to the actively playing player
-          preferredPlayerKey = ""
-          var k = playerCanonicalKey(otherPlaying)
-          if (k) lastActivePlayerKey = k
           return otherPlaying
         }
         // Nothing else is playing — keep showing the preferred player (paused)
@@ -568,8 +605,6 @@ Item {
     // 2. Currently playing player (picks most recently started)
     var playingPlayer = mostRecentPlayingPlayer()
     if (playingPlayer) {
-      var pk = playerCanonicalKey(playingPlayer)
-      if (pk) lastActivePlayerKey = pk
       return playingPlayer
     }
 
@@ -585,13 +620,30 @@ Item {
     for (var i = 0; i < players.length; i++) {
       var p = players[i]
       if (p && !isProxyPlayer(p) && hasMetadata(p)) {
-        var fKey = playerCanonicalKey(p)
-        if (fKey) lastActivePlayerKey = fKey
         return p
       }
     }
 
     return null
+  }
+
+  // Runs the memory-writing side effects selectActivePlayer() used to perform
+  // inline, once activePlayer has actually settled and this binding is off the
+  // call stack (deferred via Qt.callLater in onActivePlayerChanged below).
+  function rememberActivePlayer() {
+    var key = activePlayer ? playerCanonicalKey(activePlayer) : ""
+    if (key) lastActivePlayerKey = key
+
+    if (preferredPlayerKey && key !== preferredPlayerKey) {
+      var preferred = playerForKey(preferredPlayerKey)
+      // Mirrors selectActivePlayer's case 1: the preferred player is paused
+      // and playback moved to a different, actively-playing player, so the
+      // sticky preference no longer applies. (A preferred player that's
+      // simply gone is already cleared by syncPlayingOrder's alive check.)
+      if (preferred && hasMetadata(preferred) && !isPlayerActive(preferred)) {
+        preferredPlayerKey = ""
+      }
+    }
   }
 
   function cycleSource() {
@@ -816,8 +868,34 @@ Item {
     return handled
   }
 
-  Component.onCompleted: root.syncPlayingOrder()
-  onPlayersChanged: root.syncPlayingOrder()
+  // Deferred (not called directly) for the same reason as rememberActivePlayer
+  // above: syncPlayingOrder() writes playerStartedAt/preferredPlayerKey/
+  // lastActivePlayerKey, all of which activePlayer's binding depends on. Called
+  // directly, that write could land while activePlayer's very first evaluation
+  // (during component construction, or synchronously inside this same
+  // onPlayersChanged) is still on the call stack - confirmed via Quickshell's
+  // own "Binding loop detected for property activePlayer" warning at startup,
+  // even after purifying selectActivePlayer() above. Qt.callLater moves it
+  // to a fresh event-loop tick, off that stack, and coalesces repeated calls
+  // in the same tick into one.
+  Component.onCompleted: {
+    Qt.callLater(root.syncPlayingOrder)
+    Qt.callLater(root.refreshSourcePlayers)
+  }
+  onPlayersChanged: {
+    Qt.callLater(root.syncPlayingOrder)
+    Qt.callLater(root.refreshSourcePlayers)
+  }
+  onPlayerStartedAtChanged: Qt.callLater(root.refreshSourcePlayers)
+  onPlaybackVersionChanged: Qt.callLater(root.refreshSourcePlayers)
+  // orderedSourcePlayers() ranks players partly via playerHasActiveStream(),
+  // which reads playbackStreams (PipeWire-derived) directly - the old eager
+  // `sourcePlayers` binding picked this up automatically via QML's transitive
+  // dependency tracking. This plain/deferred version needs it wired explicitly,
+  // or the popup's activity-based sort order would go stale whenever only a
+  // stream's corked/uncorked state changed with no accompanying MPRIS signal
+  // (exactly the stale-PlaybackStatus scenario playerActivityRank exists for).
+  onPlaybackStreamsChanged: Qt.callLater(root.refreshSourcePlayers)
 
   Timer {
     id: trackOsdTimer

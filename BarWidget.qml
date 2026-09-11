@@ -215,6 +215,13 @@ BarWidget {
 
   function close() { popupOpen = false }
   property real maxLabelWidth: 220
+  // Width of the visualizer when it sits beside the track text instead of
+  // filling the whole pill behind it (see waveCanvas/flowRow below) - was a
+  // full-pill background with the title/artist text centered on top of it,
+  // which made the moving wave/bars/etc. compete with the text for
+  // readability. Icon-only modes (minimized, !showText) still use the full
+  // pill width since there's no text there to read past.
+  property real visualizerStripWidth: Style.space(30)
 
   function playerKey(player) {
     if (!player) return ""
@@ -283,7 +290,9 @@ BarWidget {
     height: Math.min(parent.height - Style.space(6), Style.space(28))
     width: root.isMinimized
       ? height
-      : (root.showText ? (flowRow.implicitWidth + Style.space(16)) : Style.space(110))
+      : (root.showText
+          ? (Style.space(2) + root.visualizerStripWidth + Style.space(7) + flowRow.implicitWidth + Style.space(8))
+          : Style.space(110))
     radius: height / 2
     clip: true
     color: clickArea.containsMouse ? Util.alpha(root.bar ? root.bar.barForeground : Color.foreground, 0.05) : "transparent"
@@ -299,9 +308,18 @@ BarWidget {
     // Dynamic Multi-Mode Continuous Audio Visualizer Canvas
     Canvas {
       id: waveCanvas
-      anchors.fill: parent
-      anchors.margins: Style.space(2)
       visible: !root.isMinimized
+      // Side by side with flowRow's icon+text in text mode (a narrow left-hand
+      // strip) instead of anchors.fill: parent with the text centered on top
+      // of it - full pill width still applies to the icon-only modes below,
+      // which have no text to compete with.
+      anchors.left: parent.left
+      anchors.top: parent.top
+      anchors.bottom: parent.bottom
+      anchors.leftMargin: Style.space(2)
+      anchors.topMargin: Style.space(2)
+      anchors.bottomMargin: Style.space(2)
+      width: root.showText ? root.visualizerStripWidth : (parent.width - Style.space(4))
 
       property real phase: 0
 
@@ -372,7 +390,12 @@ BarWidget {
           }
         } else if (mode === "bars") {
           // 2. ADAPTIVE FREQUENCY EQUALIZER BARS
-          var numBars = root.showText ? 16 : 22
+          // Scaled to the canvas's actual width rather than a showText-keyed
+          // constant: the visualizer strip is much narrower (~30px) beside the
+          // text than it is filling the whole pill (~100px+) in icon-only mode,
+          // and a fixed 16 bars packed into 30px rendered as an illegible smear.
+          // The divisor matches the old !showText density (22 bars at ~106px).
+          var numBars = Math.max(3, Math.round(width / 5))
           var barW = (width / numBars) * 0.45
           var gap = (width / numBars) * 0.55
           ctx.fillStyle = energy > 0.4 ? Color.accent : Util.alpha(Color.accent, 0.4)
@@ -385,7 +408,8 @@ BarWidget {
           }
         } else if (mode === "dots") {
           // 3. PULSING WAVE MATRIX BEADS
-          var numDots = root.showText ? 14 : 18
+          // Width-scaled for the same reason as numBars above.
+          var numDots = Math.max(3, Math.round(width / 6))
           var step = width / (numDots + 1)
           ctx.fillStyle = energy > 0.4 ? Color.accent : Util.alpha(Color.accent, 0.4)
           for (var d = 1; d <= numDots; d++) {
@@ -399,7 +423,8 @@ BarWidget {
           }
         } else if (mode === "particles") {
           // 4. FLOWING SOUND DUST / SPARKS
-          var numParts = root.showText ? 12 : 16
+          // Width-scaled for the same reason as numBars above.
+          var numParts = Math.max(3, Math.round(width / 7))
           for (var pIdx = 0; pIdx < numParts; pIdx++) {
             var speed = 20 + energy * 20 + bassPulse * 10
             var px = ((pIdx * 28 + (phase / (Math.PI * 2)) * width * (0.6 + energy * 0.6)) % width)
@@ -455,10 +480,12 @@ BarWidget {
       }
     }
 
-    // Full Expanded Mode (Music icon + Scrolling song name over flow)
+    // Full Expanded Mode (Music icon + Scrolling song name, beside the flow visualizer)
     Row {
       id: flowRow
-      anchors.centerIn: parent
+      anchors.verticalCenter: parent.verticalCenter
+      anchors.left: waveCanvas.right
+      anchors.leftMargin: Style.space(7)
       spacing: Style.space(7)
       visible: !root.isMinimized && root.showText
 
