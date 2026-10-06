@@ -333,21 +333,19 @@ BarWidget {
       anchors.bottomMargin: Style.space(2)
       width: root.showText ? root.visualizerStripWidth : (parent.width - Style.space(4))
 
-      // Was driven by a synthetic phase accumulator that advanced on a fixed
-      // wall-clock rate regardless of what was playing - every mode traced
-      // the same canned shape at all times, even silence. Both scrollX
-      // (particles) and wavePhase (wave) below only advance in proportion to
-      // root.currentEnergy, so at energy 0 nothing moves at all; bars/dots/
-      // particles/cava separately go straight to a real, static 0 through
-      // shape(energy) below, with no animation driving them either.
+      // Real per-band spectrum (root.mediaService.spectrumBands, a 14-band
+      // live Goertzel analysis - see Service.qml) instead of one aggregate
+      // loudness scalar. Every mode below reads its own slice of the real
+      // spectrum, so bars/dots/particles/cava genuinely move independently
+      // like a real equalizer instead of all rising and falling together
+      // off the same number; wave draws the actual frequency curve instead
+      // of a formula. scrollX still just paces particles' x-flow (speed
+      // tracks real energy, frozen at 0 energy - no motion with nothing
+      // playing).
       property real scrollX: 0
-      property real wavePhase: 0
-      property real dotsPhase: 0
 
       function sampleEnergy(dt) {
         scrollX += dt * root.currentEnergy * 50
-        wavePhase += dt * root.currentEnergy * (Math.PI * 2) / 1.6
-        dotsPhase += dt * root.currentEnergy * (Math.PI * 2) / 1.1
         requestPaint()
       }
 
@@ -359,20 +357,19 @@ BarWidget {
         onTriggered: waveCanvas.sampleEnergy(interval / 1000)
       }
 
-      // Fixed per-element multipliers (not time-varying) for bars/dots/
-      // particles/cava: staggering each element off a few-hundred-ms-old
-      // history sample made them barely differ for slow-changing audio like
-      // ambient music, so most of the strip just sat near flat while only
-      // one or two elements lagged into a visible value. A real equalizer
-      // instead moves every element from the *same* current level at once
-      // (true cava behavior - bars rise and fall together, not staggered)
-      // and gets its per-element variety from fixed weights instead.
-      readonly property var elementWeights: [0.55, 1.0, 0.75, 0.45, 0.9, 0.65, 0.4, 0.85, 0.6, 1.0, 0.5, 0.78]
-      function weightFor(index) { return elementWeights[index % elementWeights.length] }
+      // Resamples the real band array (whatever its length) onto `count`
+      // elements by nearest-neighbor index mapping, so bar/dot/particle
+      // counts (which scale with canvas width, not the band count) each
+      // still read a genuine, distinct slice of the spectrum.
+      function bandAt(bands, index, count) {
+        if (!bands || bands.length === 0) return 0
+        var i = Math.min(bands.length - 1, Math.floor((index / count) * bands.length))
+        return bands[i]
+      }
 
-      // Perceptual curve so quiet passages still read as visible motion
-      // instead of flat-lining: raw linear energy near the idle floor
-      // (~0.15) renders as a barely-there sliver otherwise.
+      // Perceptual curve so quiet bands still read as visible motion
+      // instead of flat-lining: raw linear values near the AGC floor
+      // render as a barely-there sliver otherwise.
       function shape(v) { return Math.pow(Math.max(0, Math.min(1, v)), 0.6) }
 
       onPaint: {
@@ -383,36 +380,36 @@ BarWidget {
         var midY = height / 2
         var energy = root.currentEnergy
         var mode = root.visualizerMode
+        var bands = root.mediaService ? root.mediaService.spectrumBands : []
+        var bn = bands.length
 
         if (mode === "wave") {
-          // Two sine curves at different spatial frequencies and phase
-          // speeds, so they cross and intertwine instead of running as
-          // parallel mirrored offsets. Amplitude comes from the real energy
-          // (0 when nothing's playing - a flat line at the baseline) and
-          // wavePhase only advances when there's real energy to drive it
-          // (see sampleEnergy), so the motion itself is real-reactive too,
-          // not a fixed loop running underneath whatever the level is doing.
-          var waveAmp = shape(energy) * height * 0.4
+          // The real frequency-response curve itself (bass on the left,
+          // treble on the right) instead of a sine formula - genuinely
+          // reflects what's playing, and is "wavy" because real spectra
+          // are. A second curve walks the same bands in reverse (treble
+          // to bass), so the two lines cross wherever the spectrum's low
+          // and high ends happen to agree, instead of running parallel.
           ctx.lineWidth = 1.2
           ctx.strokeStyle = energy > 0.4 ? Color.accent : Util.alpha(Color.accent, 0.4)
           ctx.beginPath()
-          for (var x = 0; x <= width; x += 3) {
-            var k = (x / width) * Math.PI * 4
-            var y = midY + Math.sin(k + wavePhase) * waveAmp
-            if (x === 0) ctx.moveTo(x, y)
+          for (var i = 0; i < bn; i++) {
+            var x = bn > 1 ? (i / (bn - 1)) * width : 0
+            var y = midY - shape(bands[i]) * height * 0.42
+            if (i === 0) ctx.moveTo(x, y)
             else ctx.lineTo(x, y)
           }
           ctx.stroke()
 
-          if (energy > 0.05) {
+          if (bn > 0) {
             ctx.lineWidth = 0.9
             ctx.strokeStyle = root.bar ? root.bar.barForeground : Color.foreground
             ctx.beginPath()
-            for (var x2 = 0; x2 <= width; x2 += 3) {
-              var k2 = (x2 / width) * Math.PI * 3
-              var y2 = midY + Math.sin(k2 - wavePhase * 1.4) * (waveAmp * 0.75)
-              if (x2 === 0) ctx.moveTo(x2, y2)
-              else ctx.lineTo(x2, y2)
+            for (var j = 0; j < bn; j++) {
+              var xj = bn > 1 ? (j / (bn - 1)) * width : 0
+              var yj = midY + shape(bands[bn - 1 - j]) * height * 0.32
+              if (j === 0) ctx.moveTo(xj, yj)
+              else ctx.lineTo(xj, yj)
             }
             ctx.stroke()
           }
@@ -424,10 +421,9 @@ BarWidget {
           var numBars = Math.max(3, Math.round(width / 5))
           var barW = (width / numBars) * 0.45
           var gap = (width / numBars) * 0.55
-          var barLevel = shape(energy)
           ctx.fillStyle = energy > 0.4 ? Color.accent : Util.alpha(Color.accent, 0.4)
           for (var b = 0; b < numBars; b++) {
-            var bh = barLevel * weightFor(b) * height * 0.85 + 2
+            var bh = shape(bandAt(bands, b, numBars)) * height * 0.85 + 2
             var bx = b * (barW + gap) + gap / 2
             var by = midY - bh / 2
             ctx.fillRect(bx, by, barW, bh)
@@ -436,12 +432,11 @@ BarWidget {
           // Width-scaled for the same reason as numBars above.
           var numDots = Math.max(3, Math.round(width / 6))
           var step = width / (numDots + 1)
-          var dotLevel = shape(energy)
           ctx.fillStyle = energy > 0.4 ? Color.accent : Util.alpha(Color.accent, 0.4)
           for (var d = 1; d <= numDots; d++) {
             var dx = d * step
-            var dsample = dotLevel * weightFor(d)
-            var dy = midY + Math.sin(dotsPhase + d * 0.6) * dsample * height * 0.4
+            var dsample = shape(bandAt(bands, d, numDots))
+            var dy = midY + (d % 2 === 0 ? 1 : -1) * dsample * height * 0.4
             var r = 1.5 + dsample * 1.8
             ctx.beginPath()
             ctx.arc(dx, dy, r, 0, Math.PI * 2)
@@ -450,12 +445,11 @@ BarWidget {
         } else if (mode === "particles") {
           // Width-scaled for the same reason as numBars above. X position
           // scrolls on real elapsed time (speed still tracks real energy);
-          // size/Y amplitude come from the live level, not a trig formula.
+          // size/Y amplitude come from this particle's own band.
           var numParts = Math.max(3, Math.round(width / 7))
-          var partLevel = shape(energy)
           for (var pIdx = 0; pIdx < numParts; pIdx++) {
             var px = (pIdx * 28 + scrollX) % width
-            var psample = partLevel * weightFor(pIdx)
+            var psample = shape(bandAt(bands, pIdx, numParts))
             var py = midY + (pIdx % 2 === 0 ? 1 : -1) * psample * height * 0.35
             ctx.fillStyle = (pIdx % 2 === 0) ? (energy > 0.4 ? Color.accent : Util.alpha(Color.accent, 0.4)) : (root.bar ? root.bar.barForeground : Color.foreground)
             ctx.beginPath()
@@ -478,10 +472,9 @@ BarWidget {
           var numCavaBars = Math.max(3, Math.round(width / 5))
           var cavaBarW = (width / numCavaBars) * 0.45
           var cavaGap = (width / numCavaBars) * 0.55
-          var cavaLevel = shape(energy)
           ctx.fillStyle = energy > 0.4 ? Color.accent : Util.alpha(Color.accent, 0.4)
           for (var cb = 0; cb < numCavaBars; cb++) {
-            var cbh = cavaLevel * weightFor(cb) * height
+            var cbh = shape(bandAt(bands, cb, numCavaBars)) * height
             var cbx = cb * (cavaBarW + cavaGap) + cavaGap / 2
             ctx.fillRect(cbx, height - cbh, cavaBarW, cbh)
           }

@@ -186,9 +186,16 @@ Item {
     // until python3 itself exits, which only happens once pw-record dies,
     // which only happens once the trap runs - a deadlock with the earlier
     // foreground-python3 design.
+    //
+    // stream.capture.sink=true: without it, `pw-record --target=<output-stream-node>`
+    // links as a generic monitor input that mostly never actually receives this
+    // node's audio - reproduced live: 186/187 captured chunks were pure silence
+    // (all-zero samples) despite Quickshell's own PwNodePeakMonitor simultaneously
+    // reporting real, loud peak data for the exact same node. This property makes
+    // pw-record actually tap the node's own rendered output instead.
     fallbackPeakProc.command = [
       "bash", "-c",
-      "set -uo pipefail; NODE_ID=\"$1\"; if ! [[ \"$NODE_ID\" =~ ^[0-9]+$ ]]; then exit 1; fi; set -m; pw-record --target=\"$NODE_ID\" -P '{ format=s16 rate=44100 channels=2 }' - 2>/dev/null | python3 -u -c '\nimport struct, sys\nwhile True:\n    data = sys.stdin.buffer.read(4096)\n    if not data:\n        break\n    n = len(data) // 2\n    if n == 0:\n        continue\n    samples = struct.unpack(\"<\" + str(n) + \"h\", data[:n * 2])\n    peak = max(abs(s) for s in samples) / 32768.0\n    print(\"%.4f\" % peak, flush=True)\n' & JOB_PID=$!; trap 'kill -TERM -- \"-$JOB_PID\" 2>/dev/null' EXIT TERM INT; wait \"$JOB_PID\"",
+      "set -uo pipefail; NODE_ID=\"$1\"; if ! [[ \"$NODE_ID\" =~ ^[0-9]+$ ]]; then exit 1; fi; set -m; pw-record --target=\"$NODE_ID\" -P '{ format=s16 rate=44100 channels=2 stream.capture.sink=true }' - 2>/dev/null | python3 -u -c '\nimport struct, sys\nwhile True:\n    data = sys.stdin.buffer.read(4096)\n    if not data:\n        break\n    n = len(data) // 2\n    if n == 0:\n        continue\n    samples = struct.unpack(\"<\" + str(n) + \"h\", data[:n * 2])\n    peak = max(abs(s) for s in samples) / 32768.0\n    print(\"%.4f\" % peak, flush=True)\n' & JOB_PID=$!; trap 'kill -TERM -- \"-$JOB_PID\" 2>/dev/null' EXIT TERM INT; wait \"$JOB_PID\"",
       "--",
       String(nodeId)
     ]
@@ -204,7 +211,10 @@ Item {
   }
 
   onAudioLevelUnreliableChanged: refreshFallbackPeakMeter()
-  onFallbackPeakTargetNodeChanged: refreshFallbackPeakMeter()
+  onFallbackPeakTargetNodeChanged: {
+    refreshFallbackPeakMeter()
+    refreshSpectrumMeter()
+  }
 
   Process {
     id: fallbackPeakProc
@@ -221,6 +231,111 @@ Item {
     onExited: {
       root.fallbackPeakActive = false
       root.fallbackPeakLevel = 0
+    }
+  }
+
+  // Real per-band spectrum for BarWidget's visualizer modes, so bars/dots/
+  // particles/cava each reflect their own frequency content (a real
+  // equalizer) instead of all moving together off one aggregate loudness
+  // scalar. Deliberately not a dependency on the `cava` binary (not
+  // installed, and this plugin shouldn't require installing it) - reuses
+  // the same pw-record capture this file already depends on, piped through
+  // a small python3 Goertzel analyzer (stdlib only, no numpy) instead of
+  // cava's own FFT. 14 log-spaced bands (~55Hz-14kHz) is enough resolution
+  // for a 100-150px bar strip; each band Goertzel's at block size 2048,
+  // which only costs ~14*2048 float ops per ~46ms block - negligible.
+  // Each band self-normalizes against its own slowly-decaying recent peak
+  // (an AGC per band), so output is already a 0-1 value and needs no
+  // separate gain tuning per source the way the peak meters above do.
+  readonly property int spectrumBandCount: 14
+  property var spectrumBands: []
+
+  function stopSpectrumMeter() {
+    spectrumProc.running = false
+    root.spectrumBands = []
+  }
+
+  function startSpectrumMeter() {
+    var node = root.fallbackPeakTargetNode
+    if (!node) return
+    var nodeId = Number(node.id)
+    if (!Number.isInteger(nodeId) || nodeId < 0) return
+
+    spectrumProc.running = false
+    var script = "import sys, struct, math\n" +
+      "SR = 44100\n" +
+      "N = 2048\n" +
+      "BANDS = " + root.spectrumBandCount + "\n" +
+      "freqs = [55.0 * (14000.0 / 55.0) ** (i / (BANDS - 1)) for i in range(BANDS)]\n" +
+      "coeffs = []\n" +
+      "for f in freqs:\n" +
+      "    k = int(0.5 + (N * f) / SR)\n" +
+      "    w = (2.0 * math.pi * k) / N\n" +
+      "    coeffs.append(2.0 * math.cos(w))\n" +
+      "band_peak = [0.001] * BANDS\n" +
+      "DECAY = 0.996\n" +
+      "buf = b\"\"\n" +
+      "while True:\n" +
+      "    chunk = sys.stdin.buffer.read(4096)\n" +
+      "    if not chunk:\n" +
+      "        break\n" +
+      "    buf += chunk\n" +
+      "    while len(buf) >= N * 4:\n" +
+      "        block = buf[:N * 4]\n" +
+      "        buf = buf[N * 4:]\n" +
+      "        samples = struct.unpack(\"<\" + str(N * 2) + \"h\", block)\n" +
+      "        mono = [(samples[2 * i] + samples[2 * i + 1]) * 0.5 for i in range(N)]\n" +
+      "        out = []\n" +
+      "        for idx in range(BANDS):\n" +
+      "            c = coeffs[idx]\n" +
+      "            s1 = 0.0\n" +
+      "            s2 = 0.0\n" +
+      "            for x in mono:\n" +
+      "                s0 = x + c * s1 - s2\n" +
+      "                s2 = s1\n" +
+      "                s1 = s0\n" +
+      "            power = s1 * s1 + s2 * s2 - c * s1 * s2\n" +
+      "            mag = math.sqrt(max(0.0, power)) / N\n" +
+      "            bp = max(mag, band_peak[idx] * DECAY)\n" +
+      "            band_peak[idx] = bp\n" +
+      "            out.append(min(1.0, mag / bp) if bp > 0.0001 else 0.0)\n" +
+      "        print(\" \".join(\"%.3f\" % v for v in out), flush=True)\n"
+
+    spectrumProc.command = [
+      "bash", "-c",
+      "set -uo pipefail; NODE_ID=\"$1\"; if ! [[ \"$NODE_ID\" =~ ^[0-9]+$ ]]; then exit 1; fi; set -m; pw-record --target=\"$NODE_ID\" -P '{ format=s16 rate=44100 channels=2 stream.capture.sink=true }' - 2>/dev/null | python3 -u -c '" + script + "' & JOB_PID=$!; trap 'kill -TERM -- \"-$JOB_PID\" 2>/dev/null' EXIT TERM INT; wait \"$JOB_PID\"",
+      "--",
+      String(nodeId)
+    ]
+    spectrumProc.running = true
+  }
+
+  function refreshSpectrumMeter() {
+    if (root.isPlaying && root.fallbackPeakTargetNode) {
+      startSpectrumMeter()
+    } else {
+      stopSpectrumMeter()
+    }
+  }
+
+  onIsPlayingChanged: refreshSpectrumMeter()
+
+  Process {
+    id: spectrumProc
+    stdout: SplitParser {
+      splitMarker: "\n"
+      onRead: function(data) {
+        var parts = data.trim().split(" ")
+        var arr = []
+        for (var i = 0; i < parts.length; i++) {
+          var v = parseFloat(parts[i])
+          arr.push(isFinite(v) ? Math.max(0, Math.min(1, v)) : 0)
+        }
+        if (arr.length > 0) root.spectrumBands = arr
+      }
+    }
+    onExited: {
+      root.spectrumBands = []
     }
   }
 
@@ -926,6 +1041,7 @@ Item {
       playingViaStream: playingViaStream,
       serviceIsPlaying: root.isPlaying,
       audioLevel: root.audioLevel,
+      spectrumBands: root.spectrumBands,
       activePlayerStreamFound: root.activePlayerStream !== null,
       audioCandidateStreamCount: root.audioCandidateStreams.length,
       audioLevelUnreliable: root.audioLevelUnreliable,
