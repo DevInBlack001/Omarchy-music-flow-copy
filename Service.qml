@@ -10,6 +10,17 @@ Item {
 
   property var shell: null
   property string preferredPlayerKey: ""
+  // preferredPlayerKey alone is ambiguous whenever two genuinely different
+  // player PROCESSES share the same canonical key (e.g. two separate mpv
+  // windows - see sourceListKey() above for the same underlying issue in
+  // the source list). playerForKey() resolving that key then just returns
+  // whichever matching player happens to come first in `players`, so
+  // selecting either one actually controlled the same single player
+  // instead of the one actually clicked. preferredPlayerExactKey stores
+  // the exact dbusName of the specific player object that was selected,
+  // and is checked first wherever the preferred player is resolved, with
+  // preferredPlayerKey kept only as the fallback/liveness-tracking key.
+  property string preferredPlayerExactKey: ""
   property string lastActivePlayerKey: ""
   property var playerStartedAt: ({})
   property var pendingTrackOsd: null
@@ -587,6 +598,7 @@ Item {
   function syncPlayingOrder() {
     var next = {}
     var alive = {}
+    var aliveExact = {}
     var serial = playSerial
 
     for (var i = 0; i < players.length; i++) {
@@ -596,6 +608,8 @@ Item {
       if (!key) continue
 
       alive[key] = true
+      var exact = playerKey(p)
+      if (exact) aliveExact[exact] = true
       if (!isPlayerActive(p)) continue
 
       if (playerStartedAt[key] === undefined) {
@@ -607,6 +621,7 @@ Item {
     }
 
     if (preferredPlayerKey && !alive[preferredPlayerKey]) preferredPlayerKey = ""
+    if (preferredPlayerExactKey && !aliveExact[preferredPlayerExactKey]) preferredPlayerExactKey = ""
     if (lastActivePlayerKey && !alive[lastActivePlayerKey]) lastActivePlayerKey = ""
 
     playSerial = serial
@@ -720,20 +735,31 @@ Item {
   // now live in rememberActivePlayer() below, deferred via Qt.callLater so they
   // can never run while this binding is still on the call stack.
   function selectActivePlayer() {
-    // 1. User explicitly selected a preferred player
+    // 1. User explicitly selected a preferred player - stays selected
+    // regardless of what else starts playing elsewhere, until the user
+    // picks a different source or this one disappears entirely (cleared
+    // in syncPlayingOrder's alive-check above). Previously this fell back
+    // to "whatever else is actively playing" the moment the selected
+    // player merely paused, so picking a source and hitting pause on it
+    // silently handed control to a different player - the reported
+    // "controls stuck to one source" behavior.
     if (preferredPlayerKey) {
-      var preferred = playerForKey(preferredPlayerKey)
+      // preferredPlayerExactKey disambiguates which specific player object
+      // was actually clicked when multiple real players share the same
+      // canonical key (see its declaration above) - checked first, with
+      // playerForKey(preferredPlayerKey) as a fallback if that exact
+      // object is no longer present but another of the same app is.
+      var preferred = null
+      if (preferredPlayerExactKey) {
+        for (var pi = 0; pi < players.length; pi++) {
+          if (players[pi] && playerKey(players[pi]) === preferredPlayerExactKey) {
+            preferred = players[pi]
+            break
+          }
+        }
+      }
+      if (!preferred) preferred = playerForKey(preferredPlayerKey)
       if (preferred && hasMetadata(preferred)) {
-        if (isPlayerActive(preferred)) {
-          return preferred
-        }
-        // Preferred player is paused — check if any OTHER player is actively playing
-        var otherPlaying = mostRecentPlayingPlayer()
-        if (otherPlaying) {
-          // A different player is actively playing — switch to the actively playing player
-          return otherPlaying
-        }
-        // Nothing else is playing — keep showing the preferred player (paused)
         return preferred
       }
     }
@@ -769,17 +795,13 @@ Item {
   function rememberActivePlayer() {
     var key = activePlayer ? playerCanonicalKey(activePlayer) : ""
     if (key) lastActivePlayerKey = key
-
-    if (preferredPlayerKey && key !== preferredPlayerKey) {
-      var preferred = playerForKey(preferredPlayerKey)
-      // Mirrors selectActivePlayer's case 1: the preferred player is paused
-      // and playback moved to a different, actively-playing player, so the
-      // sticky preference no longer applies. (A preferred player that's
-      // simply gone is already cleared by syncPlayingOrder's alive check.)
-      if (preferred && hasMetadata(preferred) && !isPlayerActive(preferred)) {
-        preferredPlayerKey = ""
-      }
-    }
+    // No longer clears preferredPlayerKey here: selectActivePlayer's case 1
+    // now always returns the preferred player while it resolves and has
+    // metadata, so activePlayer only diverges from it when the preference
+    // couldn't be resolved at all - which just means automatic selection
+    // (cases 2-4) is filling in, not that the preference should be
+    // forgotten. A preference that's truly gone is already cleared by
+    // syncPlayingOrder's alive-check.
   }
 
   function cycleSource() {
@@ -854,6 +876,7 @@ Item {
     var player = playerForKey(key)
     if (!player || !hasMetadata(player)) return false
     preferredPlayerKey = playerCanonicalKey(player)
+    preferredPlayerExactKey = playerKey(player)
     if (!player.isPlaying && (player.canPlay || player.canTogglePlaying)) {
       playPlayer(player)
     }
@@ -907,6 +930,7 @@ Item {
     var nextKey = playerCanonicalKey(next)
 
     preferredPlayerKey = nextKey
+    preferredPlayerExactKey = playerKey(next)
     lastActivePlayerKey = nextKey
 
     if (transferPlayback && currentWasPlaying && next && nextKey !== currentKey) {
@@ -997,6 +1021,7 @@ Item {
     if (handled && key) {
       var cKey = playerCanonicalKey(player)
       preferredPlayerKey = cKey
+      preferredPlayerExactKey = key
       lastActivePlayerKey = cKey
     }
     if (showFeedback !== false)
