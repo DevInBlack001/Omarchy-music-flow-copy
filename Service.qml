@@ -81,6 +81,93 @@ Item {
     return list
   }
 
+  // playerHasActiveStream()'s "uncorked = active" check is meaningless for
+  // mpv: reproduced live via pw-dump, mpv never sets pulse.corked at all
+  // (absent, not "false") since it's a native PipeWire client rather than
+  // going through the pulse compatibility layer, so the check always read
+  // it as "active" regardless of whether it was genuinely paused - both of
+  // two persistently-paused mpv sources ranked as active this way, with no
+  // transient pause-override involved (confirmed via live debug dump).
+  // PipeWire's own node run-state (what pw-dump's info.state shows as
+  // idle/running) isn't exposed through Quickshell's PwNode object either
+  // (confirmed: absent from its property list). The only remaining signal
+  // that actually reflects real audio flow is live peak level, so every
+  // playback stream (not just the active player's correlated ones - see
+  // audioCandidateMonitors below for that narrower case) gets its own
+  // PwNodePeakMonitor, and "active via stream" requires genuine audibility
+  // within the last 1.5s, not just an absent cork flag.
+  Instantiator {
+    id: allStreamMonitors
+    model: root.playbackStreams
+    delegate: PwNodePeakMonitor {
+      required property var modelData
+      node: modelData
+      enabled: true
+    }
+  }
+
+  property var streamLastAudibleAt: ({})
+
+  Timer {
+    interval: 200
+    running: true
+    repeat: true
+    onTriggered: {
+      var now = Date.now()
+      var next = {}
+      for (var i = 0; i < allStreamMonitors.count; i++) {
+        var mon = allStreamMonitors.objectAt(i)
+        if (!mon || !mon.node) continue
+        var id = mon.node.id
+        var prevAt = root.streamLastAudibleAt[id] || 0
+        if (mon.peak > 0.01) {
+          next[id] = now
+        } else if (now - prevAt < 1500) {
+          // Keeps a recent-enough timestamp across a brief real silence
+          // (a quiet passage, a gap between tracks) instead of flickering
+          // the icon off and back on every time the level briefly dips.
+          next[id] = prevAt
+        }
+      }
+      root.streamLastAudibleAt = next
+    }
+  }
+
+  function streamAudibleRecently(node) {
+    if (!node) return false
+    var at = root.streamLastAudibleAt[node.id]
+    return at !== undefined && (Date.now() - at) < 1500
+  }
+
+  function playerHasGenuinelyActiveStream(player) {
+    var streams = MediaModel.matchingActiveStreams(player, playbackStreams)
+    if (streams.length === 0) return false
+    // matchingActiveStreams matches by app name/label alone, which can't
+    // tell apart two real processes of the same app (confirmed live: two
+    // separate mpv windows' streams are both labeled "mpv" with no
+    // process-identifying property PipeWire exposes for either - same
+    // ambiguity as the player list, but one layer down). PipeWire's
+    // media.name DOES carry the real per-stream track title ("<title> -
+    // mpv", confirmed live), so when this player's own current title is
+    // embedded in more than one matched stream's media.name, narrow to
+    // just the stream(s) that actually mention it instead of trusting
+    // app-name matching alone to have picked the right one.
+    var title = String(player.trackTitle || "").toLowerCase()
+    if (title && streams.length > 1) {
+      var titled = []
+      for (var i = 0; i < streams.length; i++) {
+        var props = streams[i].properties || {}
+        var mediaName = String(props["media.name"] || "").toLowerCase()
+        if (mediaName.indexOf(title) !== -1) titled.push(streams[i])
+      }
+      if (titled.length > 0) streams = titled
+    }
+    for (var j = 0; j < streams.length; j++) {
+      if (streamAudibleRecently(streams[j])) return true
+    }
+    return false
+  }
+
   // Per-app volume: the PipeWire stream node correlated to the active player, if any.
   readonly property var activePlayerStream: activePlayer ? MediaModel.findPlayerStream(activePlayer, playbackStreams) : null
   readonly property bool hasVolumeControl: activePlayerStream !== null && activePlayerStream.audio !== null
@@ -583,10 +670,6 @@ Item {
     return MediaModel.playerHasPlaybackStream(player, playbackStreams)
   }
 
-  function playerHasActiveStream(player) {
-    return MediaModel.playerHasActiveStream(player, playbackStreams)
-  }
-
   // MPRIS PlaybackStatus can go stale while a player is actually producing audio -
   // Chromium in particular can report "Stopped" while one of its tabs still has an
   // unmuted, uncorked PipeWire stream flowing (observed live: 3 active Chromium
@@ -606,7 +689,7 @@ Item {
       return 0
     }
     if (player.isPlaying) return 2
-    if (playerHasActiveStream(player)) return 1
+    if (playerHasGenuinelyActiveStream(player)) return 1
     return 0
   }
 
@@ -1129,7 +1212,7 @@ Item {
   }
   onPlayerStartedAtChanged: Qt.callLater(root.refreshSourcePlayers)
   onPlaybackVersionChanged: Qt.callLater(root.refreshSourcePlayers)
-  // orderedSourcePlayers() ranks players partly via playerHasActiveStream(),
+  // orderedSourcePlayers() ranks players partly via playerHasGenuinelyActiveStream(),
   // which reads playbackStreams (PipeWire-derived) directly - the old eager
   // `sourcePlayers` binding picked this up automatically via QML's transitive
   // dependency tracking. This plain/deferred version needs it wired explicitly,
