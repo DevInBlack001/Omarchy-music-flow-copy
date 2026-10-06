@@ -107,24 +107,27 @@ BarWidget {
   // a constant. Falls back to the old fixed energy when no matching PipeWire stream could
   // be found for the player at all. Paused/idle keep the ambient drift levels.
   //
-  // audioGain was 2.4, which sounds like a modest boost but isn't: live-sampled
+  // audioGain went 2.4 -> 1.15 in an earlier session, still not low enough: live
   // mediaService.audioLevel for ordinary loud playback (a YouTube video in Chromium)
-  // sat in the 0.33-0.86 range, and 2.4x of that clips the Math.min(1.0, ...) ceiling
-  // for the overwhelming majority of samples (14/15 in one live capture) - the exact
-  // same constant 1.0 the "no live data" branch above returns. So the genuinely
-  // reactive path was visually indistinguishable from the ambient fallback for most
-  // real playback, which is what read as "it's falling back" even though
-  // hasLiveAudioLevel/fallbackPeakActive correctly reported real data was in use.
-  // Dropped to a gain that only lifts genuinely quiet passages up toward the ceiling,
-  // instead of pinning ordinary loud playback there too.
-  property real audioGain: 1.15
-  property real audioFloor: 0.15
+  // sat in the 0.77-0.86 range in a live capture, and even 1.15x of that clips the
+  // Math.min(1.0, ...) ceiling almost every sample - every visualizer mode rendered
+  // the same near-maxed, visually frozen shape regardless of the real level actually
+  // moving underneath it ("nothing is moving" despite audioLevel measurably
+  // fluctuating sample to sample). The canvas now applies its own perceptual curve
+  // (shape(), in BarWidget's Canvas) to lift quiet passages instead, so this no
+  // longer needs to pre-boost the signal at all - any gain here just reintroduces
+  // the same ceiling-clipping for already-loud content.
+  property real audioGain: 1.0
   readonly property real liveAudioLevel: (mediaService && mediaService.audioLevel) || 0
   readonly property bool hasLiveAudioLevel: Boolean(mediaService && mediaService.hasLiveAudioLevel)
+  // Was a nonzero idle/paused baseline (0.08-0.18) and an always-on 0.15
+  // floor while playing, so every graph/line visualizer mode kept a
+  // resting height even with nothing actually happening - never a true
+  // zero. All three branches now return 0 whenever there's no real level
+  // to show; only genuinely live audio produces nonzero energy.
   readonly property real targetEnergy: {
-    if (!isPlaying) return hasMedia ? 0.18 : 0.08
-    if (!hasLiveAudioLevel) return 1.0
-    return Math.max(audioFloor, Math.min(1.0, liveAudioLevel * audioGain))
+    if (!isPlaying || !hasLiveAudioLevel) return 0
+    return Math.max(0, Math.min(1.0, liveAudioLevel * audioGain))
   }
   property real currentEnergy: targetEnergy
 
@@ -330,31 +333,47 @@ BarWidget {
       anchors.bottomMargin: Style.space(2)
       width: root.showText ? root.visualizerStripWidth : (parent.width - Style.space(4))
 
-      property real phase: 0
+      // Was driven by a synthetic phase accumulator that advanced on a fixed
+      // wall-clock rate regardless of what was playing - every mode traced
+      // the same canned shape at all times, even silence. Both scrollX
+      // (particles) and wavePhase (wave) below only advance in proportion to
+      // root.currentEnergy, so at energy 0 nothing moves at all; bars/dots/
+      // particles/cava separately go straight to a real, static 0 through
+      // shape(energy) below, with no animation driving them either.
+      property real scrollX: 0
+      property real wavePhase: 0
+      property real dotsPhase: 0
 
-      // Phase speed scales with root.currentEnergy instead of running on a fixed
-      // wall-clock loop: previously phase advanced a full cycle every 2200ms
-      // regardless of what was playing, so only the wave's amplitude reacted to
-      // real audio - the motion itself always looked like the same repeating
-      // loop no matter how loud or quiet the track got (reported: "moving in a
-      // short loop", not in sync with the sound). Baseline rate matches the old
-      // fixed 2200ms/cycle; energy scales it from ~0.4x (quiet/idle ambient
-      // drift, motion never freezes abruptly) up to ~2x (loud) so a real beat
-      // drop visibly speeds the motion up, not just its amplitude.
-      FrameAnimation {
-        id: phaseDriver
-        running: true
-        readonly property real baseRate: (Math.PI * 2) / 2.2
-
-        onTriggered: {
-          if (frameTime <= 0 || frameTime > 1) return
-          var speed = baseRate * (0.4 + root.currentEnergy * 1.6)
-          var next = waveCanvas.phase + speed * frameTime
-          waveCanvas.phase = next >= Math.PI * 2 ? next - Math.PI * 2 : next
-        }
+      function sampleEnergy(dt) {
+        scrollX += dt * root.currentEnergy * 50
+        wavePhase += dt * root.currentEnergy * (Math.PI * 2) / 1.6
+        dotsPhase += dt * root.currentEnergy * (Math.PI * 2) / 1.1
+        requestPaint()
       }
 
-      onPhaseChanged: requestPaint()
+      Timer {
+        id: sampleTimer
+        interval: 33
+        running: true
+        repeat: true
+        onTriggered: waveCanvas.sampleEnergy(interval / 1000)
+      }
+
+      // Fixed per-element multipliers (not time-varying) for bars/dots/
+      // particles/cava: staggering each element off a few-hundred-ms-old
+      // history sample made them barely differ for slow-changing audio like
+      // ambient music, so most of the strip just sat near flat while only
+      // one or two elements lagged into a visible value. A real equalizer
+      // instead moves every element from the *same* current level at once
+      // (true cava behavior - bars rise and fall together, not staggered)
+      // and gets its per-element variety from fixed weights instead.
+      readonly property var elementWeights: [0.55, 1.0, 0.75, 0.45, 0.9, 0.65, 0.4, 0.85, 0.6, 1.0, 0.5, 0.78]
+      function weightFor(index) { return elementWeights[index % elementWeights.length] }
+
+      // Perceptual curve so quiet passages still read as visible motion
+      // instead of flat-lining: raw linear energy near the idle floor
+      // (~0.15) renders as a barely-there sliver otherwise.
+      function shape(v) { return Math.pow(Math.max(0, Math.min(1, v)), 0.6) }
 
       onPaint: {
         var ctx = getContext("2d")
@@ -365,105 +384,104 @@ BarWidget {
         var energy = root.currentEnergy
         var mode = root.visualizerMode
 
-        // Multi-frequency rhythm & beat intensity physics
-        var bassPulse = Math.pow(Math.abs(Math.sin(phase * 2.5)), 3) * energy
-        var melodySwell = (0.5 + 0.5 * Math.sin(phase * 0.35)) * energy
-        var intensity = 0.2 + (bassPulse * 0.5 + melodySwell * 0.3) * energy
-
         if (mode === "wave") {
-          // 1. DUAL HARMONIC REACTIVE OCEAN WAVE
-          var amp = height * (0.06 + energy * (0.22 + intensity * 0.15))
-
-          ctx.lineWidth = 1.2 + bassPulse * 0.8
+          // Two sine curves at different spatial frequencies and phase
+          // speeds, so they cross and intertwine instead of running as
+          // parallel mirrored offsets. Amplitude comes from the real energy
+          // (0 when nothing's playing - a flat line at the baseline) and
+          // wavePhase only advances when there's real energy to drive it
+          // (see sampleEnergy), so the motion itself is real-reactive too,
+          // not a fixed loop running underneath whatever the level is doing.
+          var waveAmp = shape(energy) * height * 0.4
+          ctx.lineWidth = 1.2
           ctx.strokeStyle = energy > 0.4 ? Color.accent : Util.alpha(Color.accent, 0.4)
           ctx.beginPath()
           for (var x = 0; x <= width; x += 3) {
             var k = (x / width) * Math.PI * 4
-            var y = midY + Math.sin(k + phase * (0.8 + energy * 0.4)) * Math.cos(k * 0.5 + phase * 0.6) * amp
+            var y = midY + Math.sin(k + wavePhase) * waveAmp
             if (x === 0) ctx.moveTo(x, y)
             else ctx.lineTo(x, y)
           }
           ctx.stroke()
 
-          if (energy > 0.25) {
+          if (energy > 0.05) {
             ctx.lineWidth = 0.9
             ctx.strokeStyle = root.bar ? root.bar.barForeground : Color.foreground
             ctx.beginPath()
             for (var x2 = 0; x2 <= width; x2 += 3) {
               var k2 = (x2 / width) * Math.PI * 3
-              var y2 = midY + Math.sin(k2 - phase * 1.2) * (amp * 0.65)
+              var y2 = midY + Math.sin(k2 - wavePhase * 1.4) * (waveAmp * 0.75)
               if (x2 === 0) ctx.moveTo(x2, y2)
               else ctx.lineTo(x2, y2)
             }
             ctx.stroke()
           }
         } else if (mode === "bars") {
-          // 2. ADAPTIVE FREQUENCY EQUALIZER BARS
           // Scaled to the canvas's actual width rather than a showText-keyed
           // constant: the visualizer strip is much narrower (~30px) beside the
           // text than it is filling the whole pill (~100px+) in icon-only mode,
           // and a fixed 16 bars packed into 30px rendered as an illegible smear.
-          // The divisor matches the old !showText density (22 bars at ~106px).
           var numBars = Math.max(3, Math.round(width / 5))
           var barW = (width / numBars) * 0.45
           var gap = (width / numBars) * 0.55
+          var barLevel = shape(energy)
           ctx.fillStyle = energy > 0.4 ? Color.accent : Util.alpha(Color.accent, 0.4)
           for (var b = 0; b < numBars; b++) {
-            var barFreq = Math.abs(Math.sin(phase * 2.0 + b * 0.75) * Math.cos(phase * 1.2 + b * 0.35))
-            var bh = (barFreq * (height * (0.15 + energy * (0.3 + intensity * 0.35))) + 2)
+            var bh = barLevel * weightFor(b) * height * 0.85 + 2
             var bx = b * (barW + gap) + gap / 2
             var by = midY - bh / 2
             ctx.fillRect(bx, by, barW, bh)
           }
         } else if (mode === "dots") {
-          // 3. PULSING WAVE MATRIX BEADS
           // Width-scaled for the same reason as numBars above.
           var numDots = Math.max(3, Math.round(width / 6))
           var step = width / (numDots + 1)
+          var dotLevel = shape(energy)
           ctx.fillStyle = energy > 0.4 ? Color.accent : Util.alpha(Color.accent, 0.4)
           for (var d = 1; d <= numDots; d++) {
             var dx = d * step
-            var dotOsc = Math.sin(phase * 2.0 + d * 0.6)
-            var dy = midY + dotOsc * (height * (0.08 + energy * (0.18 + intensity * 0.16)))
-            var r = (1.5 + (bassPulse * 1.0) + (energy * 0.8))
+            var dsample = dotLevel * weightFor(d)
+            var dy = midY + Math.sin(dotsPhase + d * 0.6) * dsample * height * 0.4
+            var r = 1.5 + dsample * 1.8
             ctx.beginPath()
             ctx.arc(dx, dy, r, 0, Math.PI * 2)
             ctx.fill()
           }
         } else if (mode === "particles") {
-          // 4. FLOWING SOUND DUST / SPARKS
-          // Width-scaled for the same reason as numBars above.
+          // Width-scaled for the same reason as numBars above. X position
+          // scrolls on real elapsed time (speed still tracks real energy);
+          // size/Y amplitude come from the live level, not a trig formula.
           var numParts = Math.max(3, Math.round(width / 7))
+          var partLevel = shape(energy)
           for (var pIdx = 0; pIdx < numParts; pIdx++) {
-            var speed = 20 + energy * 20 + bassPulse * 10
-            var px = ((pIdx * 28 + (phase / (Math.PI * 2)) * width * (0.6 + energy * 0.6)) % width)
-            var py = midY + Math.sin(px * 0.08 + phase + pIdx) * (height * (0.08 + energy * (0.2 + intensity * 0.15)))
+            var px = (pIdx * 28 + scrollX) % width
+            var psample = partLevel * weightFor(pIdx)
+            var py = midY + (pIdx % 2 === 0 ? 1 : -1) * psample * height * 0.35
             ctx.fillStyle = (pIdx % 2 === 0) ? (energy > 0.4 ? Color.accent : Util.alpha(Color.accent, 0.4)) : (root.bar ? root.bar.barForeground : Color.foreground)
             ctx.beginPath()
-            ctx.arc(px, py, 1.4 + energy * 0.8 + bassPulse * 0.6, 0, Math.PI * 2)
+            ctx.arc(px, py, 1.4 + psample * 1.4, 0, Math.PI * 2)
             ctx.fill()
           }
         } else if (mode === "pulse") {
-          // 5. RHYTHMIC BREATHING AUDIO HEARTBEAT
-          var pulseScale = 0.25 + energy * (0.35 + intensity * 0.4)
+          // Driven directly by the live scalar, no synthetic beat formula.
+          var pulseScale = 0.25 + energy * 0.65
           var grad = ctx.createRadialGradient(width / 2, midY, 2, width / 2, midY, (width / 2) * pulseScale)
           grad.addColorStop(0, energy > 0.4 ? Color.accent : Util.alpha(Color.accent, 0.3))
           grad.addColorStop(1, "transparent")
           ctx.fillStyle = grad
           ctx.fillRect(0, 0, width, height)
         } else if (mode === "cava") {
-          // 6. CLASSIC CAVA-STYLE EQUALIZER
-          // Same bar count/width scaling as "bars" above, but anchored to the
-          // bottom (y = height, baseline = 0 height when silent) and growing
-          // straight up only, instead of "bars"'s symmetric grow-from-middle -
-          // the look cava itself uses.
+          // Classic cava-style equalizer: same bar count/width scaling as
+          // "bars" above, but anchored to the bottom (0 height when silent)
+          // and growing straight up only, instead of "bars"'s symmetric
+          // grow-from-middle.
           var numCavaBars = Math.max(3, Math.round(width / 5))
           var cavaBarW = (width / numCavaBars) * 0.45
           var cavaGap = (width / numCavaBars) * 0.55
+          var cavaLevel = shape(energy)
           ctx.fillStyle = energy > 0.4 ? Color.accent : Util.alpha(Color.accent, 0.4)
           for (var cb = 0; cb < numCavaBars; cb++) {
-            var cavaFreq = Math.abs(Math.sin(phase * 2.0 + cb * 0.75) * Math.cos(phase * 1.2 + cb * 0.35))
-            var cbh = cavaFreq * energy * height
+            var cbh = cavaLevel * weightFor(cb) * height
             var cbx = cb * (cavaBarW + cavaGap) + cavaGap / 2
             ctx.fillRect(cbx, height - cbh, cavaBarW, cbh)
           }
@@ -841,19 +859,25 @@ BarWidget {
         width: parent.width
         spacing: Style.space(6)
 
-        // Flow instead of Row: the exact pixel width available here depends on
-        // theme spacing overrides, font metrics, and popup width clamping that
-        // can't be predicted from fixed numbers alone (a hardcoded width already
-        // overflowed the popup's edge once at this row's natural content width).
-        // Flow wraps the toggle pill onto its own line if it doesn't fit,
-        // instead of letting it render past the popup's edge - the popup's
-        // height already sizes to column.implicitHeight, so a wrap just makes
-        // the popup a bit taller instead of visually overflowing sideways.
-        Flow {
+        // Column instead of Flow/Row: Column only ever positions children
+        // vertically and leaves their x alone, so each child below can use
+        // anchors.horizontalCenter to actually center itself - a positioner
+        // that also controls x (Row, Flow) overrides any anchor on its
+        // direct children, which is why centering wasn't possible before.
+        Column {
           width: parent.width
           spacing: Style.space(6)
 
-          Row {
+          Grid {
+            // Grid instead of Flow: a fixed column count gives a
+            // deterministic, centerable block width (columns * cell width)
+            // regardless of each label's text length, instead of Flow's
+            // width-dependent wrap point - and it still reliably wraps the
+            // 6 mode buttons onto a second row instead of overflowing the
+            // popup edge, which is what broke when Cava was added as a 6th
+            // button inside a plain (non-wrapping) Row.
+            anchors.horizontalCenter: parent.horizontalCenter
+            columns: 3
             spacing: Style.space(4)
             Repeater {
               model: [
@@ -931,6 +955,7 @@ BarWidget {
           // Text / Pure Flow Toggle Pill
           BorderSurface {
             id: textToggleBtn
+            anchors.horizontalCenter: parent.horizontalCenter
             // Sized from the label's own implicit width instead of a fixed guess -
             // a hardcoded width here is exactly what overflowed the popup's edge.
             width: toggleLabel.implicitWidth + Style.space(16)
