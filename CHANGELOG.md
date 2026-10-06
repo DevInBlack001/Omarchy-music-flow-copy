@@ -6,6 +6,26 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ## [Unreleased]
 
+## [1.2.3] - 2026-10-06
+
+### Fixed
+
+- **Pausing one source made a different, untouched source of the same app
+  show as playing too (and vice versa).** `playerActivityRank()`'s stream
+  fallback treated an absent `pulse.corked` property as "active" - mpv
+  never sets it at all (a native PipeWire client, not going through the
+  pulse compatibility layer), so it always read as active regardless of
+  real state. Replaced with real peak monitoring: every playback stream
+  gets its own `PwNodePeakMonitor`, with a 1.5s grace window tracking
+  genuine recent audibility instead of trusting an absent cork flag.
+  That exposed a second bug: stream-to-player matching is also app-name-
+  only, so it couldn't tell two real mpv processes' streams apart either
+  (confirmed live: both labeled plain "mpv", no PipeWire property
+  distinguishes which process owns which). PipeWire's `media.name` does
+  carry the real per-stream track title, so matching now narrows to the
+  stream(s) whose `media.name` actually contains the player's own current
+  track whenever the app-name match is ambiguous.
+
 ## [1.2.2] - 2026-10-06
 
 ### Fixed
@@ -587,7 +607,8 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
   `MouseArea.containsMouse`. Switched to an explicit `hovered` property
   driven only by `onEntered`/`onExited`.
 
-[Unreleased]: https://github.com/DevInBlack001/Omarchy-music-flow-copy/compare/v1.2.2...HEAD
+[Unreleased]: https://github.com/DevInBlack001/Omarchy-music-flow-copy/compare/v1.2.3...HEAD
+[1.2.3]: https://github.com/DevInBlack001/Omarchy-music-flow-copy/compare/v1.2.2...v1.2.3
 [1.2.2]: https://github.com/DevInBlack001/Omarchy-music-flow-copy/compare/v1.2.1...v1.2.2
 [1.2.1]: https://github.com/DevInBlack001/Omarchy-music-flow-copy/compare/v1.2.0...v1.2.1
 [1.2.0]: https://github.com/DevInBlack001/Omarchy-music-flow-copy/compare/v1.1.0...v1.2.0
