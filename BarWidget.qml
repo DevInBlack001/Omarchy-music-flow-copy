@@ -11,7 +11,7 @@ BarWidget {
   moduleName: "custom.media"
 
   property var service: null
-  property string visualizerMode: "wave" // "wave", "bars", "dots", "particles", "pulse"
+  property string visualizerMode: "wave" // "wave", "bars", "dots", "particles", "pulse", "cava"
   property bool showText: true           // Toggle track title / artist text in bar capsule
 
   // The original repo registered this plugin under a per-user id
@@ -214,12 +214,11 @@ BarWidget {
   property bool isMinimized: false
 
   function close() { popupOpen = false }
-  // Was 220: that let the scrolling title/artist region (and so the whole
-  // pill) stretch far wider on the bar than the fixed-width chips beside it,
-  // even for a short title. Trimmed to keep the capsule closer in scale to
-  // the rest of the bar while still leaving room for most short titles to
-  // show without scrolling.
-  property real maxLabelWidth: 140
+  // Was 220, then 140: still stretched the pill wider than the other bar
+  // chips for a short title. Trimmed further to keep the capsule closer in
+  // scale to the rest of the bar; most short titles still show without
+  // scrolling, longer ones just scroll a bit sooner.
+  property real maxLabelWidth: 100
   // Width of the visualizer when it sits beside the track text instead of
   // filling the whole pill behind it (see waveCanvas/flowRow below) - was a
   // full-pill background with the title/artist text centered on top of it,
@@ -296,7 +295,7 @@ BarWidget {
     width: root.isMinimized
       ? height
       : (root.showText
-          ? (Style.space(2) + root.visualizerStripWidth + Style.space(7) + flowRow.implicitWidth + Style.space(8))
+          ? (Style.space(1) + root.visualizerStripWidth + Style.space(5) + flowRow.implicitWidth + Style.space(6))
           // Was Style.space(110): wider than the visualizer (which fills this
           // whole pill in icon-only mode, unlike the narrow strip it gets
           // beside text) needs to still read clearly, so it left noticeable
@@ -452,6 +451,22 @@ BarWidget {
           grad.addColorStop(1, "transparent")
           ctx.fillStyle = grad
           ctx.fillRect(0, 0, width, height)
+        } else if (mode === "cava") {
+          // 6. CLASSIC CAVA-STYLE EQUALIZER
+          // Same bar count/width scaling as "bars" above, but anchored to the
+          // bottom (y = height, baseline = 0 height when silent) and growing
+          // straight up only, instead of "bars"'s symmetric grow-from-middle -
+          // the look cava itself uses.
+          var numCavaBars = Math.max(3, Math.round(width / 5))
+          var cavaBarW = (width / numCavaBars) * 0.45
+          var cavaGap = (width / numCavaBars) * 0.55
+          ctx.fillStyle = energy > 0.4 ? Color.accent : Util.alpha(Color.accent, 0.4)
+          for (var cb = 0; cb < numCavaBars; cb++) {
+            var cavaFreq = Math.abs(Math.sin(phase * 2.0 + cb * 0.75) * Math.cos(phase * 1.2 + cb * 0.35))
+            var cbh = cavaFreq * energy * height
+            var cbx = cb * (cavaBarW + cavaGap) + cavaGap / 2
+            ctx.fillRect(cbx, height - cbh, cavaBarW, cbh)
+          }
         }
       }
     }
@@ -846,7 +861,8 @@ BarWidget {
                 { id: "bars", name: "Bars", icon: "󰝛" },
                 { id: "dots", name: "Dots", icon: "󰄰" },
                 { id: "particles", name: "Sparks", icon: "󰠱" },
-                { id: "pulse", name: "Pulse", icon: "󰓎" }
+                { id: "pulse", name: "Pulse", icon: "󰓎" },
+                { id: "cava", name: "Cava", icon: "󰤽" }
               ]
 
               BorderSurface {
