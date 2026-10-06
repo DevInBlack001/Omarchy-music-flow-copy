@@ -613,6 +613,27 @@ Item {
     playerStartedAt = next
   }
 
+  // playerCanonicalKey() alone collapses multiple genuinely distinct player
+  // PROCESSES of the same app (e.g. two separate mpv windows, both just
+  // "mpv") down to one shared key - reproduced live: 2 separate real mpv
+  // processes playing different tracks, together registering 5 dbus names
+  // between them (mpv-mpris's instance-suffixed names don't reliably
+  // correlate 1:1 with the real process; one single process here owned two
+  // DIFFERENT instance suffixes at once), so the source list only ever
+  // showed one of the two. That canonical key has to stay app-name-only
+  // everywhere else (playerStartedAt/preferredPlayerKey/lastActivePlayerKey
+  // all need it stable across a track change, not shifting underneath
+  // them), so this is a separate, display-only key used just for listing:
+  // appending the current track signature keeps same-process duplicate
+  // dbus registrations collapsed (they report the same title) while
+  // letting different processes playing different content list separately.
+  function sourceListKey(player) {
+    var base = playerCanonicalKey(player)
+    if (!base) return ""
+    var sig = trackSignature(player)
+    return sig ? (base + "::" + sig) : base
+  }
+
   function orderedSourcePlayers() {
     var list = []
     var seen = {}
@@ -620,7 +641,7 @@ Item {
     for (var i = 0; i < players.length; i++) {
       var p = players[i]
       if (!p || isProxyPlayer(p)) continue
-      var cKey = playerCanonicalKey(p)
+      var cKey = sourceListKey(p)
       if (!cKey || seen[cKey]) continue
       seen[cKey] = true
       if (hasMetadata(p)) {
@@ -649,7 +670,7 @@ Item {
     for (var i = 0; i < players.length; i++) {
       var p = players[i]
       if (!p || isProxyPlayer(p)) continue
-      var cKey = playerCanonicalKey(p)
+      var cKey = sourceListKey(p)
       if (!cKey || seen[cKey]) continue
       seen[cKey] = true
       if (canCycleSource(p)) {
