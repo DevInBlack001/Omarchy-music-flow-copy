@@ -214,7 +214,12 @@ BarWidget {
   property bool isMinimized: false
 
   function close() { popupOpen = false }
-  property real maxLabelWidth: 220
+  // Was 220: that let the scrolling title/artist region (and so the whole
+  // pill) stretch far wider on the bar than the fixed-width chips beside it,
+  // even for a short title. Trimmed to keep the capsule closer in scale to
+  // the rest of the bar while still leaving room for most short titles to
+  // show without scrolling.
+  property real maxLabelWidth: 140
   // Width of the visualizer when it sits beside the track text instead of
   // filling the whole pill behind it (see waveCanvas/flowRow below) - was a
   // full-pill background with the title/artist text centered on top of it,
@@ -292,7 +297,12 @@ BarWidget {
       ? height
       : (root.showText
           ? (Style.space(2) + root.visualizerStripWidth + Style.space(7) + flowRow.implicitWidth + Style.space(8))
-          : Style.space(110))
+          // Was Style.space(110): wider than the visualizer (which fills this
+          // whole pill in icon-only mode, unlike the narrow strip it gets
+          // beside text) needs to still read clearly, so it left noticeable
+          // empty-looking background around it. Trimmed while keeping enough
+          // room for the wave/bars/dots/particles shapes to stay legible.
+          : Style.space(72))
     radius: height / 2
     clip: true
     color: clickArea.containsMouse ? Util.alpha(root.bar ? root.bar.barForeground : Color.foreground, 0.05) : "transparent"
