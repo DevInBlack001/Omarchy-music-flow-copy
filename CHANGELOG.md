@@ -6,6 +6,42 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ## [Unreleased]
 
+## [1.2.2] - 2026-10-06
+
+### Fixed
+
+- **Controls were effectively stuck to one source.** `preferredPlayerKey`
+  (the user's explicit source selection) was stored as the collapsed
+  canonical key, ambiguous whenever two real player processes share the
+  same app name, so selecting either of two real sources silently
+  controlled the same one. Separately, `selectActivePlayer()` actively
+  handed control back to "whatever else is playing" the moment the
+  selected player merely paused. Added `preferredPlayerExactKey` (the
+  exact dbus name of the specific player object clicked, checked first
+  wherever the preferred player is resolved) and removed the steal-back
+  behavior - an explicit selection now stays selected regardless of what
+  else starts or stops playing, until the user picks a different source
+  or it disappears entirely.
+- **Each source row's play/pause glyph only ever reflected one dbus
+  alias's sometimes-stale `isPlaying`, and had no actual play/pause
+  control** - clicking anywhere on a row only selected (and auto-played)
+  it, never paused it. Added a dedicated play/pause toggle to each source
+  row (its own `MouseArea`, stacked above the row's select-only area) and
+  removed `selectPlayer()`'s auto-play side effect, so selecting a source
+  and playing/pausing it are now separate actions.
+- **The main transport icon, and now each source row's icon, could show
+  the wrong play/pause state.** mpv keeps its PipeWire sink node open
+  briefly after `pause()`, so the stream-fallback in
+  `playerActivityRank()` kept ranking a just-paused player as active.
+  Added a short-lived pause override, tracked per real process (a single
+  process can expose several simultaneous dbus aliases as separate player
+  objects, and a sibling alias not directly commanded can independently
+  keep reporting active), cleared immediately on a subsequent play so a
+  quick pause-then-resume doesn't get stuck showing paused. Added
+  `isSourceActive()`, grouping activity across all of a process's dbus
+  aliases instead of trusting whichever single one a list happened to
+  keep.
+
 ## [1.2.1] - 2026-10-06
 
 ### Fixed
@@ -551,7 +587,8 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
   `MouseArea.containsMouse`. Switched to an explicit `hovered` property
   driven only by `onEntered`/`onExited`.
 
-[Unreleased]: https://github.com/DevInBlack001/Omarchy-music-flow-copy/compare/v1.2.1...HEAD
+[Unreleased]: https://github.com/DevInBlack001/Omarchy-music-flow-copy/compare/v1.2.2...HEAD
+[1.2.2]: https://github.com/DevInBlack001/Omarchy-music-flow-copy/compare/v1.2.1...v1.2.2
 [1.2.1]: https://github.com/DevInBlack001/Omarchy-music-flow-copy/compare/v1.2.0...v1.2.1
 [1.2.0]: https://github.com/DevInBlack001/Omarchy-music-flow-copy/compare/v1.1.0...v1.2.0
 [1.1.0]: https://github.com/DevInBlack001/Omarchy-music-flow-copy/compare/v1.0.0...v1.1.0
