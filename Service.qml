@@ -22,6 +22,46 @@ Item {
   // preferredPlayerKey kept only as the fallback/liveness-tracking key.
   property string preferredPlayerExactKey: ""
   property string lastActivePlayerKey: ""
+  // playerActivityRank()'s PipeWire-stream fallback (below) treats "has an
+  // uncorked stream" as still-active, which lags behind a pause command -
+  // reproduced live: mpv keeps its PipeWire sink node open/uncorked for a
+  // moment after player.pause(), so even with MPRIS correctly reporting
+  // isPlaying=false, the stream fallback kept ranking it as active, and
+  // the play/pause icon (driven by this rank) never flipped. Since this
+  // only ever matters for a pause *this plugin itself just issued*, track
+  // it explicitly instead of trying to re-derive "really paused" from
+  // PipeWire state: a brief window where the just-paused player's rank is
+  // forced to 0 regardless of what the stream fallback still reports.
+  //
+  // Keyed by sourceListKey (same real process, not just the one exact
+  // dbus alias actually commanded) - a single real process can register
+  // several simultaneous dbus names as separate player objects, and a
+  // sibling alias we didn't directly pause can independently keep
+  // reporting active (its own isPlaying or stream-fallback lagging on its
+  // own schedule) even once the one we commanded has gone quiet.
+  property string pauseOverrideKey: ""
+  property real pauseOverrideUntil: 0
+
+  function markExplicitPause(player) {
+    var key = sourceListKey(player)
+    if (!key) return
+    pauseOverrideKey = key
+    pauseOverrideUntil = Date.now() + 2000
+  }
+
+  // A subsequent play/resume on the same player within that 2s window must
+  // clear the override immediately, or it keeps forcing rank 0 (reported as
+  // "still paused") for up to 2s after the player has genuinely resumed -
+  // reproduced live: pause, then play again inside the window, left
+  // serviceIsPlaying stuck false despite the player's own isPlaying already
+  // back to true.
+  function clearPauseOverrideFor(player) {
+    var key = sourceListKey(player)
+    if (key && pauseOverrideKey === key) {
+      pauseOverrideKey = ""
+      pauseOverrideUntil = 0
+    }
+  }
   property var playerStartedAt: ({})
   property var pendingTrackOsd: null
   property int playSerial: 0
@@ -395,7 +435,7 @@ Item {
   // When the current player pauses/resumes, activePlayer.isPlaying notifies this binding.
   // Falls back to isPlayerActive's PipeWire-stream check for players whose MPRIS
   // PlaybackStatus is stale (see isPlayerActive above).
-  readonly property bool isPlaying: isPlayerActive(activePlayer)
+  readonly property bool isPlaying: isSourceActive(activePlayer)
 
   // Per-player signal connections — use Mpris.players (UntypedObjectModel) directly
   // as the Instantiator model so Qt creates one Connections delegate per player.
@@ -562,6 +602,9 @@ Item {
   // fallback, 0 = not active.
   function playerActivityRank(player) {
     if (!player) return 0
+    if (pauseOverrideKey && Date.now() < pauseOverrideUntil && sourceListKey(player) === pauseOverrideKey) {
+      return 0
+    }
     if (player.isPlaying) return 2
     if (playerHasActiveStream(player)) return 1
     return 0
@@ -569,6 +612,34 @@ Item {
 
   function isPlayerActive(player) {
     return playerActivityRank(player) > 0
+  }
+
+  // Checks every dbus alias of this player's real process (same canonical
+  // key), not just this one object's own isPlaying/rank - a real process
+  // can register several simultaneous dbus names as separate player
+  // objects (see sourceListKey() above), and reproduced live: one specific
+  // alias object's isPlaying can lag behind what the process is actually
+  // doing while a sibling alias already reflects the real state. The
+  // source list's play/pause icon reads this instead of isPlayerActive()
+  // on the one representative object the list happened to keep, so it
+  // isn't at the mercy of whichever single alias that was.
+  function isSourceActive(player) {
+    if (!player) return false
+    // Groups by sourceListKey (canonical key + current track), not
+    // playerCanonicalKey alone: canonicalKey collapses multiple genuinely
+    // different real processes of the same app (two separate mpv windows
+    // both just "mpv") together, so grouping by it here made one source
+    // playing report every other same-app source as "playing" too -
+    // reproduced live immediately after this was added. sourceListKey
+    // only groups aliases that are actually the same real process (they
+    // share identical current track info).
+    var lKey = sourceListKey(player)
+    if (!lKey) return isPlayerActive(player)
+    for (var i = 0; i < players.length; i++) {
+      var p = players[i]
+      if (p && sourceListKey(p) === lKey && playerActivityRank(p) > 0) return true
+    }
+    return false
   }
 
   function playerKey(player) {
@@ -872,14 +943,17 @@ Item {
     trackOsdTimer.restart()
   }
 
+  // Only focuses the player - does not start playback. Previously
+  // auto-played whatever was selected, so clicking any source while
+  // everything was paused immediately resumed it without the user
+  // touching play/pause at all. Now that each source row has its own
+  // dedicated play/pause control, selecting is a separate action from
+  // playing.
   function selectPlayer(key) {
     var player = playerForKey(key)
     if (!player || !hasMetadata(player)) return false
     preferredPlayerKey = playerCanonicalKey(player)
     preferredPlayerExactKey = playerKey(player)
-    if (!player.isPlaying && (player.canPlay || player.canTogglePlaying)) {
-      playPlayer(player)
-    }
     return true
   }
 
@@ -992,6 +1066,7 @@ Item {
         player.togglePlaying()
         handled = true
       }
+      if (handled) clearPauseOverrideFor(player)
     } else if (action === "pause") {
       actionLabel = "Pause"
       iconName = "media-pause"
@@ -1002,6 +1077,7 @@ Item {
         player.togglePlaying()
         handled = true
       }
+      if (handled) markExplicitPause(player)
     } else if (action === "playPause") {
       var isCurrentlyPlaying = player && Boolean(player.isPlaying)
       actionLabel = isCurrentlyPlaying ? "Pause" : "Play"
@@ -1015,6 +1091,10 @@ Item {
       } else if (player && !player.isPlaying && player.canPlay) {
         player.play()
         handled = true
+      }
+      if (handled) {
+        if (isCurrentlyPlaying) markExplicitPause(player)
+        else clearPauseOverrideFor(player)
       }
     }
 

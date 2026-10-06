@@ -1078,6 +1078,22 @@ BarWidget {
               ? Border.controlSpec("normal", root.bar ? root.bar.foreground : Color.foreground, Color.accent)
               : (sourceRow.hovered ? Border.controlSpec("hover-cursor", root.bar ? root.bar.foreground : Color.foreground, Color.accent) : Border.none())
 
+            // Declared before Row (and its nested play/pause MouseArea) so it
+            // stacks underneath: non-interactive content in Row still lets
+            // clicks fall through to this for select, but the play/pause
+            // icon's own MouseArea (stacked on top, inside Row below) takes
+            // priority over its small hit area instead of this swallowing
+            // every click in the row first.
+            MouseArea {
+              id: sourceCardMouse
+              anchors.fill: parent
+              hoverEnabled: true
+              cursorShape: Qt.PointingHandCursor
+              onEntered: sourceRow.hovered = true
+              onExited: sourceRow.hovered = false
+              onClicked: root.selectPlayer(sourceRow.player)
+            }
+
             Row {
               anchors.left: parent.left
               anchors.right: parent.right
@@ -1122,24 +1138,41 @@ BarWidget {
                 }
               }
 
-              Text {
-                text: (sourceRow.player && sourceRow.player.isPlaying) ? "󰏤" : "󰐊"
-                textFormat: Text.PlainText
-                color: sourceRow.selected ? Color.accent : Qt.darker(root.bar ? root.bar.foreground : Color.foreground, 1.6)
-                font.family: root.bar ? root.bar.fontFamily : Style.font.family
-                font.pixelSize: Style.font.bodySmall
+              // A real toggle, not just a status glyph: previously this only
+              // ever reflected the raw (sometimes stale - see currentEnergy's
+              // audioGain comment history) player.isPlaying, and the row's
+              // own click only ever selected-and-played, never paused, so
+              // there was no way to pause a source from here at all - the
+              // reported "play/pause on each source doesn't respond". Reads
+              // through mediaService's PipeWire-aware activity check instead
+              // of the raw MPRIS flag, and has its own MouseArea (consumes
+              // the click before it reaches the row's select-only area below)
+              // that calls playPause for this specific source.
+              Item {
+                width: playPauseIcon.implicitWidth + Style.space(12)
+                height: parent.height
                 anchors.verticalCenter: parent.verticalCenter
-              }
-            }
 
-            MouseArea {
-              id: sourceCardMouse
-              anchors.fill: parent
-              hoverEnabled: true
-              cursorShape: Qt.PointingHandCursor
-              onEntered: sourceRow.hovered = true
-              onExited: sourceRow.hovered = false
-              onClicked: root.selectPlayer(sourceRow.player)
+                Text {
+                  id: playPauseIcon
+                  anchors.centerIn: parent
+                  text: (sourceRow.player && root.mediaService && root.mediaService.isSourceActive(sourceRow.player)) ? "󰏤" : "󰐊"
+                  textFormat: Text.PlainText
+                  color: playPauseMouse.containsMouse
+                    ? Color.accent
+                    : (sourceRow.selected ? Color.accent : Qt.darker(root.bar ? root.bar.foreground : Color.foreground, 1.6))
+                  font.family: root.bar ? root.bar.fontFamily : Style.font.family
+                  font.pixelSize: Style.font.bodySmall
+                }
+
+                MouseArea {
+                  id: playPauseMouse
+                  anchors.fill: parent
+                  hoverEnabled: true
+                  cursorShape: Qt.PointingHandCursor
+                  onClicked: root.runAction("playPause", sourceRow.player)
+                }
+              }
             }
           }
         }
